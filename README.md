@@ -4,19 +4,20 @@
 
 ## 폴더 구조
 
+```
 rl-engine/
 ├── src/
-│ ├── environment.py # Gymnasium 커스텀 거래 환경 (PortfolioEnv)
-│ ├── train.py # 단일 보상함수 PPO 학습 스크립트
-│ ├── train_compare.py # 보상함수 3종(5개 변형) 비교 실험
-│ ├── test_environment.py # 환경 규격 검증 + 랜덤 에이전트 동작 테스트
-│ └── evaluate.py # Walk-Forward 백테스트 + 12개 성과지표 (예정)
-├── data/ # data-pipeline 리포의 features.parquet / returns.parquet 수신 위치 (git 제외)
-├── models/ # 학습된 PPO 모델 저장 (.zip은 git 제외, 요약 CSV만 추적)
-├── logs/ # tensorboard 학습 로그 (git 제외)
+│   ├── environment.py       # Gymnasium 커스텀 거래 환경 (PortfolioEnv)
+│   ├── train.py              # 단일 보상함수 PPO 학습 스크립트
+│   ├── train_compare.py      # 보상함수 3종(5개 변형) 비교 실험
+│   ├── test_environment.py   # 환경 규격 검증 + 랜덤 에이전트 동작 테스트
+│   └── evaluate.py           # Walk-Forward 백테스트 + 12개 성과지표 (예정)
+├── data/                      # data-pipeline 리포의 features.parquet / returns.parquet 수신 위치 (git 제외)
+├── models/                    # 학습된 PPO 모델 저장 (.zip은 git 제외, 요약 CSV만 추적)
+├── logs/                      # tensorboard 학습 로그 (git 제외)
 ├── requirements.txt
 └── README.md
-
+```
 
 ## 실행 방법
 
