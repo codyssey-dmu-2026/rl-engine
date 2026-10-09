@@ -3,145 +3,196 @@ from gymnasium import spaces               # 관측/행동 공간 정의용
 import numpy as np                         # 수치 계산
 import pandas as pd                        # 데이터프레임 처리
 
+# 지원하는 보상 함수 이름 목록 (오타 방지용)
+REWARD_TYPES = ("simple", "sharpe", "mdd")
+
 
 class PortfolioEnv(gym.Env):
-    """포트폴리오 자산배분 강화학습 환경.
+    """포트폴리오 자산배분 강화학습 환경 (v2: data-pipeline 산출물 전용).
 
-    에이전트는 매일 자산별 목표 비중을 결정하고,
-    그 결과로 발생한 수익률을 보상으로 받는다.
+    입력 데이터 2개:
+      - features: 정규화된 피처 (features_window{n}.parquet 를 train/test로 자른 것)
+                  컬럼: {ticker}_return, {ticker}_rsi, {ticker}_macd, {ticker}_is_market_open
+      - returns : 정규화 전 원래 로그수익률 (returns.parquet 중 같은 날짜 구간)
+                  컬럼: {ticker}_return  -> 실제 손익 계산(보상)에 사용
+
+    에이전트는 매일 자산별 목표 비중을 정하고, 다음 날 수익률로 보상을 받는다.
     """
+
+    metadata = {"render_modes": []}        # 화면 렌더링은 사용하지 않음
 
     def __init__(
         self,
-        prices: pd.DataFrame,              # 자산별 수정주가 (행=날짜, 열=자산)
-        features: pd.DataFrame,            # 정규화된 피처 (행=날짜, 열=피처)
-        window: int = 20,                  # 관측 윈도우 (명세 권장: 20~60 거래일)
+        features: pd.DataFrame,            # 정규화된 피처 (행=날짜)
+        returns: pd.DataFrame,             # 정규화 전 로그수익률 (행=날짜, features와 같은 인덱스)
+        lookback: int = 20,                # 과거 N일 수익률 윈도우 (명세 권장 20~60)
         fee_rate: float = 0.00015,         # 거래 수수료 0.015% (명세 지정값)
         slippage: float = 0.0005,          # 슬리피지 0.05% (명세 지정값)
-        reward_type: str = "simple",       # 보상 함수 종류: simple / sharpe / mdd
-        mdd_lambda: float = 1.0,           # 변형 3의 MDD 페널티 강도
-        mdd_limit: float = 0.15,           # Safe-Guard: MDD 15% 초과 시 조기 종료
+        reward_type: str = "simple",       # 보상 함수: simple / sharpe / mdd
+        mdd_lambda: float = 1.0,           # 변형 3의 MDD 페널티 강도 (권장 0.5~5.0)
+        mdd_limit: float = 0.15,           # Safe-Guard: MDD 15% 초과 시 에피소드 조기 종료
+        sigma_window: int = 20,            # 샤프 보상에서 변동성을 계산할 최근 일수
         initial_cash: float = 1_000_000.0, # 초기 자본금
+        random_start: bool = False,        # True면 에피소드마다 시작 날짜를 무작위로 (학습용)
+        min_episode_days: int = 60,        # 무작위 시작 시 최소한 남겨둘 일수
     ):
         super().__init__()                 # gym.Env 초기화 (필수)
 
-        # ---------- 데이터 저장 ----------
-        self.prices = prices.values                    # DataFrame → numpy (속도 향상)
-        self.features = features.values                # 피처도 numpy로 변환
-        self.n_assets = prices.shape[1]                 # 자산 개수 (예: 5)
-        self.n_features = features.shape[1]             # 피처 개수 (예: 25)
+        # ---------- 입력 검증: 잘못된 데이터는 학습 전에 바로 알려준다 ----------
+        if reward_type not in REWARD_TYPES:
+            raise ValueError(f"reward_type은 {REWARD_TYPES} 중 하나여야 합니다: {reward_type}")
+        if not features.index.equals(returns.index):
+            raise ValueError("features와 returns의 날짜 인덱스가 다릅니다 (행 개수/날짜 불일치)")
+        if len(features) < lookback + 2:
+            raise ValueError(f"데이터가 너무 짧습니다: {len(features)}행 (lookback={lookback})")
+
+        # ---------- 종목 목록: returns 컬럼명에서 티커를 뽑는다 ----------
+        # 예: "SPY_return" -> "SPY", "005930_return" -> "005930"
+        self.tickers = [c[: -len("_return")] for c in returns.columns]
+        self.n_assets = len(self.tickers)                       # 자산 개수 (예: 12)
+
+        # ---------- features를 두 덩어리로 나눈다 ----------
+        # (1) 과거 N일을 펼쳐서 볼 정규화 수익률 컬럼
+        return_cols = [f"{t}_return" for t in self.tickers]     # returns 순서와 동일하게 맞춤
+        missing = [c for c in return_cols if c not in features.columns]
+        if missing:
+            raise ValueError(f"features에 없는 컬럼: {missing}")
+        # (2) 오늘 시점만 볼 나머지 컬럼 (rsi, macd, is_market_open)
+        static_cols = [c for c in features.columns if not c.endswith("_return")]
+
+        if features.isna().any().any() or returns.isna().any().any():
+            raise ValueError("features/returns에 NaN이 있습니다 (data-pipeline 결과 확인 필요)")
+
+        # ---------- numpy 배열로 변환 (속도 향상) ----------
+        self.norm_returns = features[return_cols].to_numpy(dtype=np.float32)    # (T, N) 정규화 수익률
+        self.static_features = features[static_cols].to_numpy(dtype=np.float32) # (T, S) 오늘 피처
+        # 로그수익률 -> 단순수익률 변환: 비중 가중합은 단순수익률로 해야 정확하다
+        self.simple_returns = np.expm1(returns.to_numpy(dtype=np.float64))      # (T, N)
+        self.dates = features.index                                             # 날짜 (분석/백테스트용)
+        self.n_steps = len(features)                                            # 전체 일수 T
+        self.n_static = len(static_cols)                                        # 오늘 피처 개수
 
         # ---------- 하이퍼파라미터 저장 ----------
-        self.window = window
+        self.lookback = lookback
         self.fee_rate = fee_rate
         self.slippage = slippage
         self.reward_type = reward_type
         self.mdd_lambda = mdd_lambda
         self.mdd_limit = mdd_limit
+        self.sigma_window = sigma_window
         self.initial_cash = initial_cash
+        self.random_start = random_start
+        self.min_episode_days = min_episode_days
 
-        # ---------- 일간 수익률 미리 계산 ----------
-        self.returns = np.diff(np.log(self.prices), axis=0)   # (T-1, n_assets)
-        self.returns = np.vstack([np.zeros(self.n_assets), self.returns])  # 첫 행 0 추가
-
-        # ---------- 행동 공간 정의 ----------
+        # ---------- 행동 공간: 자산별 점수 -> softmax로 비중 변환 ----------
         self.action_space = spaces.Box(
-            low=-10.0,
-            high=10.0,
-            shape=(self.n_assets,),
-            dtype=np.float32,
+            low=-10.0, high=10.0, shape=(self.n_assets,), dtype=np.float32
         )
 
-        # ---------- 관측 공간 정의 ----------
-        obs_dim = self.n_features + self.n_assets
+        # ---------- 관측 공간 ----------
+        # [과거 lookback일 수익률 (lookback x N)] + [오늘 rsi/macd/flag] + [현재 비중 N]
+        obs_dim = lookback * self.n_assets + self.n_static + self.n_assets
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
         # ---------- 에피소드 상태 변수 (reset에서 초기화) ----------
-        self.current_step = None
-        self.weights = None
-        self.portfolio_value = None
-        self.peak_value = None
-        self.return_history = None
+        self.current_step = 0
+        self.weights = np.zeros(self.n_assets, dtype=np.float32)
+        self.portfolio_value = initial_cash
+        self.peak_value = initial_cash
+        self.return_history = []
 
     def reset(self, seed=None, options=None):
         """에피소드를 처음 상태로 되돌린다."""
-        super().reset(seed=seed)
+        super().reset(seed=seed)                                # 시드 설정 (재현성)
 
-        self.current_step = self.window
-        self.weights = np.zeros(self.n_assets, dtype=np.float32)
-        self.portfolio_value = self.initial_cash
-        self.peak_value = self.initial_cash
-        self.return_history = []
+        first = self.lookback - 1                               # 과거 N일이 모두 채워지는 첫 날
+        if self.random_start:
+            # 학습용: 에피소드마다 시작일을 무작위로 골라 데이터 전 구간을 골고루 경험하게 한다.
+            # (항상 같은 날 시작하면 Safe-Guard 조기종료 때문에 초반 구간만 반복 학습하게 됨)
+            last = self.n_steps - 1 - self.min_episode_days     # 이 날 이후에 시작하면 너무 짧음
+            self.current_step = int(self.np_random.integers(first, last + 1))
+        else:
+            self.current_step = first                           # 평가용: 항상 같은 날에서 시작
+        self.weights = np.zeros(self.n_assets, dtype=np.float32)  # 처음엔 전부 현금(비중 0)
+        self.portfolio_value = self.initial_cash                # 자본금 초기화
+        self.peak_value = self.initial_cash                     # 최고점 초기화
+        self.return_history = []                                # 수익률 기록 초기화
 
         return self._get_observation(), {}
 
     def step(self, action):
         """에이전트의 행동을 받아 하루를 진행한다."""
 
+        # ---------- 1. 행동 -> 목표 비중 (합=1, 각 원소 >= 0) ----------
         target_weights = self._softmax(action)
 
-        turnover = np.abs(target_weights - self.weights).sum()
-        cost = turnover * (self.fee_rate + self.slippage)
+        # ---------- 2. 거래비용: 비중을 바꾼 만큼 수수료+슬리피지 ----------
+        turnover = np.abs(target_weights - self.weights).sum()  # 회전율
+        cost = turnover * (self.fee_rate + self.slippage)       # 총 거래비용(비율)
 
-        self.current_step += 1
-        daily_returns = self.returns[self.current_step]
-        portfolio_return = np.dot(target_weights, daily_returns)
-        net_return = portfolio_return - cost
+        # ---------- 3. 하루 진행: 다음 날 수익률로 손익 계산 ----------
+        self.current_step += 1                                  # 하루 지남
+        day_returns = self.simple_returns[self.current_step]    # 그날 자산별 단순수익률
+        gross_return = float(np.dot(target_weights, day_returns))  # 비용 전 포트폴리오 수익률
+        net_return = gross_return - cost                        # 비용 차감 후 수익률
 
-        self.portfolio_value *= (1.0 + net_return)
+        # ---------- 4. 자산가치, MDD 갱신 ----------
+        self.portfolio_value *= 1.0 + net_return
         self.peak_value = max(self.peak_value, self.portfolio_value)
         current_mdd = (self.peak_value - self.portfolio_value) / self.peak_value
 
-        self.weights = target_weights
+        # ---------- 5. 비중 드리프트: 하루 지나면 가격 변동으로 비중이 저절로 변한다 ----------
+        # 다음 날 거래비용을 정확히 계산하려면 '목표 비중'이 아니라 '변한 비중'이 기준이어야 함
+        self.weights = (target_weights * (1.0 + day_returns) / (1.0 + gross_return)).astype(
+            np.float32
+        )
         self.return_history.append(net_return)
 
+        # ---------- 6. 보상 ----------
         reward = self._compute_reward(net_return, current_mdd)
 
-        terminated = bool(current_mdd > self.mdd_limit)
-        truncated = bool(self.current_step >= len(self.returns) - 1)
+        # ---------- 7. 종료 조건 ----------
+        terminated = bool(current_mdd > self.mdd_limit)         # Safe-Guard: MDD 15% 초과
+        truncated = bool(self.current_step >= self.n_steps - 1) # 데이터 끝
 
         info = {
+            "date": self.dates[self.current_step],              # 오늘 날짜
             "portfolio_value": self.portfolio_value,
             "mdd": current_mdd,
             "net_return": net_return,
             "weights": self.weights.copy(),
+            "target_weights": target_weights.copy(),            # SHAP/리포트용: 에이전트가 정한 비중
             "turnover": turnover,
         }
-
         return self._get_observation(), reward, terminated, truncated, info
 
     def _get_observation(self):
-        """현재 시점의 관측값을 만든다."""
-        market_features = self.features[self.current_step]
-        obs = np.concatenate([market_features, self.weights])
+        """현재 시점의 관측값: 과거 N일 수익률 + 오늘 지표 + 현재 비중."""
+        t = self.current_step
+        past = self.norm_returns[t - self.lookback + 1 : t + 1]  # (lookback, N) 오늘 포함 과거 N일
+        obs = np.concatenate([past.ravel(), self.static_features[t], self.weights])
         return obs.astype(np.float32)
 
     def _compute_reward(self, net_return, current_mdd):
-        """보상 함수 3종 — 명세 요구사항."""
-
+        """보상 함수 3종 (명세 요구사항)."""
         if self.reward_type == "simple":
-            return float(net_return)
+            return float(net_return)                            # 변형 1: r_t
 
-        elif self.reward_type == "sharpe":
-            if len(self.return_history) < 2:
-                return float(net_return)
-            sigma = np.std(self.return_history[-20:])
-            return float(net_return / (sigma + 1e-8))
+        if self.reward_type == "sharpe":
+            recent = self.return_history[-self.sigma_window :]  # 최근 N일 수익률
+            if len(recent) < 5:                                 # 표본이 너무 적으면 변동성이 불안정
+                return 0.0
+            sigma = float(np.std(recent))                       # 최근 변동성
+            return float(net_return / (sigma + 1e-8))           # 변형 2: r_t / sigma_t
 
-        elif self.reward_type == "mdd":
-            return float(net_return - self.mdd_lambda * current_mdd)
-
-        else:
-            raise ValueError(f"알 수 없는 보상 함수: {self.reward_type}")
+        # reward_type == "mdd"
+        return float(net_return - self.mdd_lambda * current_mdd)  # 변형 3: r_t - lambda*MDD_t
 
     @staticmethod
     def _softmax(x):
-        """PPO가 출력한 임의의 실수를 합=1인 비중으로 변환."""
-        x = np.clip(x, -10, 10)
-        e_x = np.exp(x - np.max(x))
+        """임의의 실수 벡터를 합=1, 각 원소>=0 인 비중으로 변환."""
+        x = np.clip(x, -10, 10)                                 # 수치 폭발 방지
+        e_x = np.exp(x - np.max(x))                             # 오버플로우 방지
         return (e_x / e_x.sum()).astype(np.float32)
