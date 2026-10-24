@@ -6,6 +6,54 @@ import pandas as pd                        # 데이터프레임 처리
 # 지원하는 보상 함수 이름 목록 (오타 방지용)
 REWARD_TYPES = ("simple", "sharpe", "mdd")
 
+# 자산별 비중 상한 (팀 설계 문서 backtest.md / decisions.md, evaluation-xai config.max_asset_weight 와 동일)
+MAX_ASSET_WEIGHT = 0.4
+
+
+def softmax(x):
+    """임의의 실수 벡터를 합=1, 각 원소>=0 인 비중으로 변환."""
+    x = np.clip(np.asarray(x, dtype=np.float64), -10, 10)  # 수치 폭발 방지
+    e_x = np.exp(x - np.max(x))                             # 오버플로우 방지
+    return e_x / e_x.sum()
+
+
+def cap_weights(weights, max_weight=MAX_ASSET_WEIGHT):
+    """합=1 비중을 '각 자산 <= max_weight' 조건으로 투영한다.
+
+    상한을 넘친 자산은 max_weight로 고정하고, 넘친 만큼을 상한 아래 자산들에
+    기존 비중에 비례해 나눠준다. 나눠준 뒤 또 넘치는 자산이 생길 수 있어 반복한다.
+    (자산 N개면 최대 N번 반복하면 끝난다)
+    """
+    w = np.asarray(weights, dtype=np.float64).copy()
+    n = len(w)
+    if max_weight * n < 1.0 - 1e-12:
+        raise ValueError(f"자산 {n}개로는 상한 {max_weight}에서 합=1을 만들 수 없습니다")
+    w = w / w.sum()                                         # 혹시 모를 합 오차 보정
+    capped = np.zeros(n, dtype=bool)                        # 상한에 고정된 자산 표시
+    for _ in range(n):
+        over = (w > max_weight) & ~capped                   # 이번에 새로 넘친 자산
+        if not over.any():
+            break
+        capped |= over
+        w[capped] = max_weight                              # 넘친 자산은 상한으로 고정
+        free = ~capped
+        room = 1.0 - max_weight * capped.sum()              # 나머지 자산들이 나눠 가질 비중
+        free_sum = w[free].sum()
+        if free_sum > 0:
+            w[free] *= room / free_sum                      # 기존 비중에 비례해 재분배
+        else:
+            w[free] = room / free.sum()                     # (이론상 없음) 전부 0이면 균등 분배
+    return np.minimum(w, max_weight)                        # 부동소수 오차로 0.4000000001 되는 것 방지
+
+
+def action_to_weights(action, max_weight=MAX_ASSET_WEIGHT):
+    """PPO 행동 -> 목표 비중 (softmax -> 상한 투영).
+
+    학습 환경과 평가(predict_weights)가 반드시 이 함수 하나만 쓰게 해서
+    학습 때 비중과 백테스트 때 비중이 어긋나지 않게 한다.
+    """
+    return cap_weights(softmax(action), max_weight)
+
 
 class PortfolioEnv(gym.Env):
     """포트폴리오 자산배분 강화학습 환경 (v2: data-pipeline 산출물 전용).
@@ -35,6 +83,7 @@ class PortfolioEnv(gym.Env):
         initial_cash: float = 1_000_000.0, # 초기 자본금
         random_start: bool = False,        # True면 에피소드마다 시작 날짜를 무작위로 (학습용)
         min_episode_days: int = 60,        # 무작위 시작 시 최소한 남겨둘 일수
+        max_weight: float = MAX_ASSET_WEIGHT,  # 자산별 비중 상한 (0.4)
     ):
         super().__init__()                 # gym.Env 초기화 (필수)
 
@@ -43,6 +92,8 @@ class PortfolioEnv(gym.Env):
             raise ValueError(f"reward_type은 {REWARD_TYPES} 중 하나여야 합니다: {reward_type}")
         if not features.index.equals(returns.index):
             raise ValueError("features와 returns의 날짜 인덱스가 다릅니다 (행 개수/날짜 불일치)")
+        if returns.shape[1] * max_weight < 1.0:
+            raise ValueError(f"자산 {returns.shape[1]}개, 상한 {max_weight}로는 비중 합=1이 불가능합니다")
         if len(features) < lookback + 2:
             raise ValueError(f"데이터가 너무 짧습니다: {len(features)}행 (lookback={lookback})")
 
@@ -83,6 +134,7 @@ class PortfolioEnv(gym.Env):
         self.initial_cash = initial_cash
         self.random_start = random_start
         self.min_episode_days = min_episode_days
+        self.max_weight = max_weight
 
         # ---------- 행동 공간: 자산별 점수 -> softmax로 비중 변환 ----------
         self.action_space = spaces.Box(
@@ -125,8 +177,8 @@ class PortfolioEnv(gym.Env):
     def step(self, action):
         """에이전트의 행동을 받아 하루를 진행한다."""
 
-        # ---------- 1. 행동 -> 목표 비중 (합=1, 각 원소 >= 0) ----------
-        target_weights = self._softmax(action)
+        # ---------- 1. 행동 -> 목표 비중 (합=1, 0 <= 각 원소 <= 0.4) ----------
+        target_weights = action_to_weights(action, self.max_weight)
 
         # ---------- 2. 거래비용: 비중을 바꾼 만큼 수수료+슬리피지 ----------
         turnover = np.abs(target_weights - self.weights).sum()  # 회전율
@@ -138,10 +190,11 @@ class PortfolioEnv(gym.Env):
         gross_return = float(np.dot(target_weights, day_returns))  # 비용 전 포트폴리오 수익률
         net_return = gross_return - cost                        # 비용 차감 후 수익률
 
-        # ---------- 4. 자산가치, MDD 갱신 ----------
+        # ---------- 4. 자산가치, 낙폭 갱신 ----------
+        # current_drawdown: '지금' 고점 대비 얼마나 빠져 있는지 (MDD는 이 값의 기간 중 최댓값)
         self.portfolio_value *= 1.0 + net_return
         self.peak_value = max(self.peak_value, self.portfolio_value)
-        current_mdd = (self.peak_value - self.portfolio_value) / self.peak_value
+        current_drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
 
         # ---------- 5. 비중 드리프트: 하루 지나면 가격 변동으로 비중이 저절로 변한다 ----------
         # 다음 날 거래비용을 정확히 계산하려면 '목표 비중'이 아니라 '변한 비중'이 기준이어야 함
@@ -150,20 +203,22 @@ class PortfolioEnv(gym.Env):
         )
         self.return_history.append(net_return)
 
-        # ---------- 6. 보상 ----------
-        reward = self._compute_reward(net_return, current_mdd)
-
-        # ---------- 7. 종료 조건 ----------
-        terminated = bool(current_mdd > self.mdd_limit)         # Safe-Guard: MDD 15% 초과
+        # ---------- 6. 종료 조건 ----------
+        terminated = bool(current_drawdown > self.mdd_limit)    # Safe-Guard: 낙폭 15% 초과
         truncated = bool(self.current_step >= self.n_steps - 1) # 데이터 끝
+
+        # ---------- 7. 보상 ----------
+        reward = self._compute_reward(net_return, current_drawdown)
+        if terminated:
+            reward -= self._safeguard_penalty()                 # 조기 종료가 이득이 되지 않게
 
         info = {
             "date": self.dates[self.current_step],              # 오늘 날짜
             "portfolio_value": self.portfolio_value,
-            "mdd": current_mdd,
+            "drawdown": current_drawdown,                      # 현재 낙폭 (MDD = 이 값의 최댓값)
             "net_return": net_return,
             "weights": self.weights.copy(),
-            "target_weights": target_weights.copy(),            # SHAP/리포트용: 에이전트가 정한 비중
+            "target_weights": target_weights.copy(),            # (float64, 상한 0.4 적용)            # SHAP/리포트용: 에이전트가 정한 비중
             "turnover": turnover,
         }
         return self._get_observation(), reward, terminated, truncated, info
@@ -175,7 +230,7 @@ class PortfolioEnv(gym.Env):
         obs = np.concatenate([past.ravel(), self.static_features[t], self.weights])
         return obs.astype(np.float32)
 
-    def _compute_reward(self, net_return, current_mdd):
+    def _compute_reward(self, net_return, current_drawdown):
         """보상 함수 3종 (명세 요구사항)."""
         if self.reward_type == "simple":
             return float(net_return)                            # 변형 1: r_t
@@ -188,11 +243,21 @@ class PortfolioEnv(gym.Env):
             return float(net_return / (sigma + 1e-8))           # 변형 2: r_t / sigma_t
 
         # reward_type == "mdd"
-        return float(net_return - self.mdd_lambda * current_mdd)  # 변형 3: r_t - lambda*MDD_t
+        return float(net_return - self.mdd_lambda * current_drawdown)  # 변형 3: r_t - lambda*DD_t
 
-    @staticmethod
-    def _softmax(x):
-        """임의의 실수 벡터를 합=1, 각 원소>=0 인 비중으로 변환."""
-        x = np.clip(x, -10, 10)                                 # 수치 폭발 방지
-        e_x = np.exp(x - np.max(x))                             # 오버플로우 방지
-        return (e_x / e_x.sum()).astype(np.float32)
+    def _safeguard_penalty(self):
+        """Safe-Guard 조기 종료 시 주는 페널티.
+
+        mdd 보상은 매 스텝 -lambda*DD_t 라서 거의 항상 음수다. 종료 후 보상이 0이면
+        '일부러 15%를 깨고 빨리 끝내기'가 누적 보상이 더 높아지는 문제가 생긴다.
+        그래서 종료를 '남은 기간 내내 낙폭이 한도(15%)에 머문 것'으로 취급해
+        lambda * mdd_limit * (남은 스텝 수) 만큼 한 번에 뺀다.
+        끝까지 버티는 정책은 매 스텝 DD <= 15% 이므로 페널티가 이보다 클 수 없다
+        -> 조기 종료로 페널티를 피하는 길이 막힌다.
+
+        simple / sharpe 보상은 낙폭을 보상에 넣지 않는 '비교 기준' 변형이라 그대로 둔다.
+        """
+        if self.reward_type != "mdd":
+            return 0.0
+        remaining = self.n_steps - 1 - self.current_step        # 데이터 끝까지 남은 스텝
+        return float(self.mdd_lambda * self.mdd_limit * remaining)

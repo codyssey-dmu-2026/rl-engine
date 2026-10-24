@@ -8,8 +8,11 @@
 rl-engine/
 ├── src/
 │   ├── environment.py       # Gymnasium 커스텀 거래 환경 (PortfolioEnv)
-│   ├── train.py              # 단일 보상함수 PPO 학습 스크립트
-│   ├── train_compare.py      # 보상함수 3종(5개 변형) 비교 실험
+│   ├── data_loader.py        # walk-forward 윈도우 로드 + fit/val/test 분리
+│   ├── rollout.py            # 평가 환경, predict_weights, 성과 요약
+│   ├── make_dummy_data.py    # data-pipeline과 같은 형식의 가짜 데이터 생성
+│   ├── train.py              # 단일 보상함수 PPO 학습 (train_one)
+│   ├── train_compare.py      # 보상함수 3종(5개 변형) 비교 실험 (train_one 반복 호출)
 │   ├── test_environment.py   # 환경 규격 검증 + 랜덤 에이전트 동작 테스트
 │   └── evaluate.py           # Walk-Forward 백테스트 + 12개 성과지표 (예정)
 ├── data/                      # data-pipeline 리포의 features.parquet / returns.parquet 수신 위치 (git 제외)
@@ -33,11 +36,12 @@ pip install -r requirements.txt
 cd src
 python test_environment.py
 
-# 4. 단일 보상함수 PPO 학습
-python train.py
+# 4. 단일 보상함수 PPO 학습 (기본: fit 학습 -> val 평가)
+python train.py --reward mdd --mdd-lambda 1.0
 
 # 5. 보상함수 3종(5개 변형) 비교 실험
-python train_compare.py
+python train_compare.py --stage val  --windows 1 2 3 4 --seeds 42 43 44   # 선택용 (val)
+python train_compare.py --stage test --windows 1 2 3 4 --seeds 42 43 44   # 최종 보고용 (test)
 
 # 6. 학습 곡선 확인
 tensorboard --logdir ../logs
@@ -49,13 +53,29 @@ tensorboard --logdir ../logs
 `data-pipeline`에서 공급하는 종목별 피처(`{ticker}_return`, `{ticker}_rsi`, `{ticker}_macd`)에 현재 포트폴리오 비중을 더해 구성한다. 현재 비중을 포함하는 이유는 에이전트가 거래비용을 인식하고 학습하도록 하기 위함이다.
 
 ### 행동 공간 (Action Space)
-연속형(Continuous)으로 설계했다. PPO가 출력한 임의의 실수 벡터를 softmax로 변환해 합이 1이 되는 자산별 비중으로 만든다.
+연속형(Continuous)으로 설계했다. PPO가 출력한 임의의 실수 벡터를 softmax로 변환해 합이 1이 되는 자산별 비중으로 만든 뒤, **자산별 상한 0.4**로 투영한다(넘친 비중은 상한 아래 자산들에 기존 비중 비례로 재분배, 반복). 상한값은 팀 설계 문서(`backtest.md`, `decisions.md`)와 evaluation-xai `config.max_asset_weight`와 같다.
+
+환경(`step`)과 평가(`rollout.predict_weights`)는 같은 함수 `environment.action_to_weights()`를 쓰므로 학습 때 비중과 백테스트 비중이 어긋나지 않는다.
 
 ### 거래비용
 수수료 0.015%, 슬리피지 0.05%를 명세 기준값으로 반영했다. 비중 변화량(회전율)에 비례해 비용을 차감한다.
 
 ### Safe-Guard
-MDD(최대낙폭)가 15%를 초과하면 에피소드를 조기 종료한다.
+현재 낙폭이 15%를 초과하면 에피소드를 조기 종료한다.
+
+MDD 페널티 보상(`r_t - λ·DD_t`)은 거의 항상 음수라서, 종료 후 보상이 0이면 "일부러 15%를 깨고 빨리 끝내기"가 누적 보상이 더 높아진다. 이를 막기 위해 Safe-Guard 종료 시 `λ × 0.15 × (남은 스텝 수)`를 한 번에 차감한다(= 남은 기간 내내 낙폭이 한도에 머문 것으로 취급). 끝까지 버티는 정책은 매 스텝 `DD_t ≤ 0.15`이므로 조기 종료로 페널티를 줄일 수 없다. 명세의 보상 수식 자체는 바꾸지 않았다. 학습 시 `VecNormalize`의 보상 클리핑은 이 페널티가 잘리지 않도록 꺼 두었다(`clip_reward=np.inf`).
+
+## 학습 / 검증 / 테스트 분리
+
+각 walk-forward 윈도우의 학습 구간 마지막 6개월을 검증(val) 구간으로 뗀다(`validation.md` 게이트 3).
+
+```
+[train_start ..... val_start ..... train_end)[train_end ..... test_end)
+|<----- fit ----->|<---- val ---->|          |<------ test ------>|
+```
+
+- `--stage val`: fit 구간에서 학습 → val 구간에서 평가. 보상형·λ·하이퍼파라미터 선택은 여기서만 한다.
+- `--stage test`: 고른 설정으로 train 전체(fit+val)를 재학습 → test 구간에서 평가. 리포트·ANOVA용 최종 성과.
 
 ## 보상 함수 3종 실험
 
@@ -63,7 +83,7 @@ MDD(최대낙폭)가 15%를 초과하면 에피소드를 조기 종료한다.
 |---|---|---|
 | 단순 수익률 | `reward = r_t` | 위험을 고려하지 않는 베이스라인 |
 | 샤프비율 기반 | `reward = r_t / (sigma_t + eps)` | 최근 20일 변동성으로 나눠 위험조정 |
-| MDD 페널티 결합 | `reward = r_t - lambda * MDD_t` | lambda ∈ {0.5, 1.0, 5.0}으로 공격적~방어적 성향 비교 |
+| MDD 페널티 결합 | `reward = r_t - lambda * MDD_t` | lambda ∈ {0.5, 1.0, 5.0}으로 공격적~방어적 성향 비교. `MDD_t`는 시점 t의 현재 낙폭(코드 변수명 `current_drawdown`) |
 
 다섯 가지 변형 모두 동일 시드(seed=42)와 동일 학습 스텝(100,000)으로 학습해 공정하게 비교한다.
 

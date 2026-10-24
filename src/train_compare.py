@@ -1,42 +1,28 @@
-from stable_baselines3 import PPO                          # PPO 알고리즘
-from stable_baselines3.common.vec_env import DummyVecEnv   # 벡터 환경 래퍼
-from stable_baselines3.common.monitor import Monitor       # 에피소드 보상 기록용 래퍼
-import pandas as pd                                         # 데이터프레임 처리
-import numpy as np                                          # 수치 계산
-import os                                                    # 폴더 생성 등 경로 처리
+"""보상함수 3종(5개 변형) 비교 실험.
 
-from environment import PortfolioEnv    # 앞서 만든 강화학습 환경
+학습 루프는 train.py 의 train_one() 하나만 쓴다 (데이터 로더·시드·저장 경로가 train.py와 항상 같다).
 
+두 단계로 나눠 돌린다:
+  1) --stage val  (기본): 각 변형을 fit 구간에서 학습 -> val 구간에서 평가.
+                          보상형/lambda 선택은 이 결과로만 한다. (test 성적을 보고 고르지 않기 위함)
+  2) --stage test       : 같은 변형을 train 전체(fit+val)로 재학습 -> test 구간에서 평가.
+                          리포트·ANOVA에 쓰는 최종 성과.
 
-# ================================================================
-# 1. 테스트용 가짜 데이터 생성 (나중에 친구 데이터로 교체할 부분)
-# ================================================================
+예)
+  python train_compare.py --timesteps 2048                     # 빠른 동작 확인
+  python train_compare.py --windows 1 2 3 4 --seeds 42 43 44   # 검증 단계 본 실험
+  python train_compare.py --stage test --windows 1 2 3 4 --seeds 42 43 44
+"""
+import argparse                            # 실행 옵션
+import time                                # 실험별 소요 시간 출력
 
-n_days = 1000                                               # 총 거래일 수 (학습엔 데이터가 좀 필요함)
-n_assets = 5                                                 # 자산 개수
-n_features = 25                                              # 피처 개수
+import pandas as pd                        # 결과 표
 
-dates = pd.date_range("2020-01-01", periods=n_days, freq="B")   # 영업일 기준 날짜 생성
+from data_loader import load_walk_forward_window
+from train import MODELS_DIR, STAGES, baseline_metrics, pick_data_dir, train_one
 
-# 랜덤워크로 가짜 주가 생성 (실제 주가처럼 누적곱 형태)
-fake_prices = pd.DataFrame(
-    100 * np.exp(np.cumsum(np.random.randn(n_days, n_assets) * 0.01, axis=0)),
-    index=dates,
-    columns=["SPY", "QQQ", "IEF", "GLD", "BIL"],             # 자산명 (친구 데이터 받으면 실제 컬럼명으로 바뀜)
-)
-
-# 정규분포 난수로 가짜 피처 생성 (이미 정규화됐다고 가정)
-fake_features = pd.DataFrame(
-    np.random.randn(n_days, n_features),
-    index=dates,
-)
-
-
-# ================================================================
-# 2. 실험할 보상 함수 설정 목록 (명세 요구사항: 최소 3종)
-# ================================================================
-
-experiments = [
+# 명세 요구사항: 보상함수 최소 3종. 변형 3은 lambda 3개로 공격적~방어적 비교
+EXPERIMENTS = [
     {"name": "simple",   "reward_type": "simple", "mdd_lambda": 1.0},   # 변형 1: 단순 수익률
     {"name": "sharpe",   "reward_type": "sharpe", "mdd_lambda": 1.0},   # 변형 2: 샤프비율 기반
     {"name": "mdd_l0.5", "reward_type": "mdd",    "mdd_lambda": 0.5},   # 변형 3a: MDD 페널티 약함 (공격적)
@@ -44,93 +30,59 @@ experiments = [
     {"name": "mdd_l5.0", "reward_type": "mdd",    "mdd_lambda": 5.0},   # 변형 3c: MDD 페널티 강함 (방어적)
 ]
 
-
-# ================================================================
-# 3. 결과를 저장할 폴더 미리 만들기
-# ================================================================
-
-os.makedirs("../models", exist_ok=True)    # models 폴더 없으면 생성 (있으면 에러 없이 넘어감)
-os.makedirs("../logs", exist_ok=True)      # logs 폴더도 동일하게 처리
+SHOW_COLS = ["stage", "window", "strategy", "seed", "cum_return", "sharpe", "max_mdd",
+             "breach_15pct", "avg_turnover", "max_weight"]
 
 
-# ================================================================
-# 4. 각 실험을 순서대로 학습 및 저장
-# ================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default=None, help="parquet 폴더 (기본: data/processed 또는 data/dummy)")
+    parser.add_argument("--stage", default="val", choices=STAGES, help="val: 선택용(기본) / test: 최종 보고용")
+    parser.add_argument("--windows", type=int, nargs="+", default=[1], help="walk-forward 윈도우 번호들")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="시드 목록 (ANOVA용으로 여러 개 권장)")
+    parser.add_argument("--timesteps", type=int, default=100_000, help="실험당 학습 스텝 (명세: 10만 이상)")
+    parser.add_argument("--lookback", type=int, default=20)
+    parser.add_argument("--only", nargs="+", default=None, help="일부 변형만 (예: --only simple mdd_l1.0)")
+    args = parser.parse_args()
 
-results_summary = []    # 나중에 비교표 만들 때 쓸 결과 저장 리스트
+    experiments = [e for e in EXPERIMENTS if args.only is None or e["name"] in args.only]
+    data_dir = pick_data_dir(args.data_dir)
+    print(f"데이터 폴더: {data_dir} | stage={args.stage} | windows={args.windows} | seeds={args.seeds}")
 
-for exp in experiments:
-    print(f"\n{'='*50}")
-    print(f"실험 시작: {exp['name']}  (reward_type={exp['reward_type']}, lambda={exp['mdd_lambda']})")
-    print(f"{'='*50}")
+    rows = []
+    for window in args.windows:
+        data = load_walk_forward_window(window, data_dir)
+        print(f"\nwindow {window}: fit {len(data.fit_features)}일 / val {len(data.val_features)}일 "
+              f"(val 시작 {data.val_start}) / test {len(data.test_features)}일")
+        rows.append(baseline_metrics(data, args.lookback, stage=args.stage))     # 동일가중 기준선
+        for seed in args.seeds:
+            for exp in experiments:
+                t0 = time.time()
+                m = train_one(data, exp["name"], exp["reward_type"], exp["mdd_lambda"],
+                              seed, args.timesteps, args.lookback, stage=args.stage)
+                rows.append(m)
+                print(f"  {m['strategy']:>14} s{seed} | 누적 {m['cum_return']:+.2%} | 샤프 {m['sharpe']:+.2f} | "
+                      f"MDD {m['max_mdd']:.2%} | 최대비중 {m['max_weight']:.3f} | {time.time() - t0:.0f}s")
 
-    # ---------- 환경 생성 ----------
-    env = PortfolioEnv(
-        fake_prices,
-        fake_features,
-        reward_type=exp["reward_type"],      # 이번 실험의 보상 함수 종류
-        mdd_lambda=exp["mdd_lambda"],        # 이번 실험의 MDD 페널티 강도
-    )
-    env = Monitor(env)                       # 에피소드 보상을 자동 기록 (학습곡선용)
-    env = DummyVecEnv([lambda: env])         # SB3가 요구하는 벡터 환경 형태로 감싸기
+    results = pd.DataFrame(rows)
+    MODELS_DIR.mkdir(exist_ok=True)
+    out = MODELS_DIR / f"compare_{args.stage}.csv"
+    results.to_csv(out, index=False)
 
-    # ---------- PPO 모델 생성 ----------
-    model = PPO(
-        policy="MlpPolicy",                  # 기본 다층 퍼셉트론 정책망
-        env=env,
-        learning_rate=3e-4,                  # 학습률
-        n_steps=2048,                        # 업데이트 전 수집할 스텝 수
-        batch_size=64,                       # 미니배치 크기
-        n_epochs=10,                         # 수집 데이터 재사용 횟수
-        gamma=0.99,                          # 할인율
-        clip_range=0.2,                      # PPO 핵심 파라미터 (정책 변화 제한폭)
-        seed=42,                             # 시드 고정 — 모든 실험에 동일하게 적용해야 공정 비교 가능
-        verbose=0,                           # 로그 너무 많이 나오지 않게 끔 (0=끔, 1=켬)
-        tensorboard_log=f"../logs/ppo_{exp['name']}",   # 실험별로 로그 폴더 분리
-    )
+    print(f"\n=== {args.stage} 구간 결과 ===")
+    print(results[SHOW_COLS].to_string(index=False))
 
-    # ---------- 학습 실행 ----------
-    model.learn(total_timesteps=100_000)     # 명세 요구사항: 최소 100,000 스텝
-
-    # ---------- 모델 저장 ----------
-    save_path = f"../models/ppo_{exp['name']}"
-    model.save(save_path)
-    print(f"저장 완료: {save_path}.zip")
-
-    # ---------- 간단 평가: 학습된 모델로 한 번 끝까지 플레이해서 최종 자산가치 확인 ----------
-    eval_env = PortfolioEnv(
-        fake_prices, fake_features,
-        reward_type=exp["reward_type"],
-        mdd_lambda=exp["mdd_lambda"],
-    )
-    obs, info = eval_env.reset(seed=42)      # 평가도 동일 시드로 (공정 비교)
-    done = False
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)   # 학습된 정책으로 결정 (탐험 없이)
-        obs, reward, terminated, truncated, info = eval_env.step(action)
-        done = terminated or truncated
-
-    # ---------- 결과 기록 ----------
-    results_summary.append({
-        "실험명": exp["name"],
-        "최종_자산가치": info["portfolio_value"],
-        "최대_MDD": info["mdd"],
-    })
-
-    print(f"최종 자산가치: {info['portfolio_value']:,.0f} | 최대 MDD: {info['mdd']:.2%}")
+    if args.stage == "val":
+        # 선택은 val 결과로만: 변형별 평균 샤프가 가장 높은 것 (윈도우·시드 평균)
+        ppo = results[results["strategy"] != "EqualWeight"]
+        ranking = ppo.groupby("strategy")["sharpe"].mean().sort_values(ascending=False)
+        print("\n[val 기준 변형별 평균 샤프]")
+        print(ranking.to_string())
+        lam = (ppo[ppo["reward_type"] == "mdd"].groupby("mdd_lambda")["sharpe"].mean())
+        if len(lam) > 0:
+            print(f"-> val 기준 lambda 선택: {lam.idxmax()}  (test는 이 결정 뒤에 --stage test 로 확인)")
+    print(f"\n결과 저장: {out}")
 
 
-# ================================================================
-# 5. 전체 실험 결과 요약 출력
-# ================================================================
-
-print(f"\n{'='*50}")
-print("전체 실험 결과 요약")
-print(f"{'='*50}")
-
-results_df = pd.DataFrame(results_summary)     # 리스트를 표(DataFrame) 형태로 변환
-print(results_df.to_string(index=False))       # 보기 좋게 출력
-
-# 결과를 CSV로도 저장해두면 리포트 작성할 때 바로 활용 가능
-results_df.to_csv("../models/experiment_summary.csv", index=False)
-print("\n요약 결과 저장 완료: models/experiment_summary.csv")
+if __name__ == "__main__":
+    main()
