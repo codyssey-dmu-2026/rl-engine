@@ -55,6 +55,19 @@ def action_to_weights(action, max_weight=MAX_ASSET_WEIGHT):
     return cap_weights(softmax(action), max_weight)
 
 
+def weights_to_action(weights, floor=1e-12):
+    """목표 비중 -> 행동 (action_to_weights의 역변환).
+
+    softmax(log w) = w 이므로, MVO처럼 비중을 직접 정하는 비교군도 같은 환경(같은 거래비용·
+    상한 투영)으로 백테스트할 수 있다. 비중이 0인 자산은 floor로 아주 작게 둔다.
+    softmax 입력이 [-10, 10]으로 잘리므로 최댓값을 10에 맞춰 범위를 최대한 쓴다
+    (그래야 비중 0 자산이 e^-20 ≈ 2e-9 수준으로 사실상 0이 된다).
+    """
+    w = np.clip(np.asarray(weights, dtype=np.float64), floor, None)
+    log_w = np.log(w / w.sum())
+    return (log_w - log_w.max() + 10.0).astype(np.float32)
+
+
 class PortfolioEnv(gym.Env):
     """포트폴리오 자산배분 강화학습 환경 (v2: data-pipeline 산출물 전용).
 

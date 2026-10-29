@@ -14,7 +14,9 @@ rl-engine/
 │   ├── train.py              # 단일 보상함수 PPO 학습 (train_one)
 │   ├── train_compare.py      # 보상함수 3종(5개 변형) 비교 실험 (train_one 반복 호출)
 │   ├── test_environment.py   # 환경 규격 검증 + 랜덤 에이전트 동작 테스트
-│   └── evaluate.py           # Walk-Forward 백테스트 + 12개 성과지표 (예정)
+│   ├── metrics.py            # 12개 성과지표 계산 (numpy/pandas만 사용)
+│   ├── test_metrics.py       # 성과지표·weights_to_action 검증
+│   └── evaluate.py           # Walk-Forward 백테스트 (저장된 PPO 모델 + 비교군, 12개 지표)
 ├── data/                      # data-pipeline 리포의 features.parquet / returns.parquet 수신 위치 (git 제외)
 ├── models/                    # 학습된 PPO 모델 저장 (.zip은 git 제외, 요약 CSV만 추적)
 ├── logs/                      # tensorboard 학습 로그 (git 제외)
@@ -43,7 +45,12 @@ python train.py --reward mdd --mdd-lambda 1.0
 python train_compare.py --stage val  --windows 1 2 3 4 --seeds 42 43 44   # 선택용 (val)
 python train_compare.py --stage test --windows 1 2 3 4 --seeds 42 43 44   # 최종 보고용 (test)
 
-# 6. 학습 곡선 확인
+# 6. Walk-Forward 백테스트 + 12개 성과지표 (5번 test 단계 모델을 불러와 평가만 함)
+python evaluate.py --stage test --windows 1 2 3 4 --seeds 42 43 44
+python evaluate.py --baselines-only        # 모델 없이 동일가중 기준선만
+python test_metrics.py                     # 지표 계산 검증
+
+# 7. 학습 곡선 확인
 tensorboard --logdir ../logs
 ```
 
@@ -87,6 +94,27 @@ MDD 페널티 보상(`r_t - λ·DD_t`)은 거의 항상 음수라서, 종료 후
 
 다섯 가지 변형 모두 동일 시드(seed=42)와 동일 학습 스텝(100,000)으로 학습해 공정하게 비교한다.
 
+## 평가 (evaluate.py)
+
+`train_compare.py`가 저장한 모델(`models/ppo_{stage}_w{n}_{변형}_s{seed}.zip`)을 불러와 각 윈도우의 평가 구간을 결정론적으로 돌린다. 학습과 같은 환경(`PortfolioEnv`, 같은 거래비용·비중 상한)을 쓰고 Safe-Guard만 끈다.
+
+- 윈도우 1~4의 test 구간(2022~2025)은 겹치지 않으므로 이어붙여 **전체 out-of-sample 기간** 성과도 계산한다.
+- 정보비율의 벤치마크는 동일가중(EqualWeight).
+- 일부 윈도우 모델이 빠진 (전략, 시드)는 기간이 달라 시드 평균에서 제외하고 경고를 띄운다.
+
+| # | 지표 | 키 | # | 지표 | 키 |
+|---|---|---|---|---|---|
+| 1 | 누적 수익률 | `cum_return` | 7 | 칼마비율 | `calmar` |
+| 2 | 연환산 수익률 | `cagr` | 8 | 승률(일간) | `win_rate` |
+| 3 | 연환산 변동성 | `ann_vol` | 9 | VaR 95% (일간) | `var_95` |
+| 4 | 샤프비율 | `sharpe` | 10 | CVaR 95% (일간) | `cvar_95` |
+| 5 | 소르티노비율 | `sortino` | 11 | 평균 회전율 | `avg_turnover` |
+| 6 | 최대낙폭(MDD) | `max_mdd` | 12 | 정보비율(vs 동일가중) | `information_ratio` |
+
+결과 CSV (`models/`): `eval_{stage}_windows.csv`(윈도우별), `eval_{stage}_walkforward.csv`(전체 기간), `eval_{stage}_summary.csv`(시드 평균±표준편차), `eval_{stage}_daily.csv`(날짜별 수익률, 그래프·ANOVA용).
+
+비교군은 `evaluate.BASELINES`에 등록한다. MVO처럼 비중을 직접 정하는 전략은 `env.simple_returns[: env.current_step + 1]`(오늘까지의 실제 수익률)로 비중을 구한 뒤 `environment.weights_to_action(비중)`으로 행동을 돌려주면 같은 거래비용·상한으로 평가된다.
+
 ## 데이터 연동 (진행 중)
 
 `data-pipeline` 리포의 `features.parquet` / `returns.parquet`를 받아 연동 예정이다. 현재까지는 랜덤 생성한 가짜 데이터로 환경 동작과 PPO 학습 파이프라인을 검증한 상태이며, 실제 데이터 연동 시 다음을 반영해야 한다:
@@ -98,7 +126,8 @@ MDD 페널티 보상(`r_t - λ·DD_t`)은 거의 항상 음수라서, 종료 후
 ## 알려진 한계점
 
 - 현재까지 PPO 학습·보상함수 비교는 전부 랜덤 가짜 데이터 기준이며, 실제 시장 데이터의 통계적 특성(두꺼운 꼬리, 변동성 군집 등)은 반영되지 않았다.
-- `evaluate.py`(Walk-Forward 백테스트, 12개 성과지표, MVO·동일가중 비교군)는 아직 구현 전이다.
+- MVO 비교군은 아직 구현 전이다 (`evaluate.BASELINES`에 등록 자리만 있음).
+- 12개 지표는 일반적인 구성으로 정했다. 팀 명세(`backtest.md`)의 지표 목록과 다르면 `metrics.py`에서 맞춘다.
 - SHAP 기반 의사결정 해석, RAG Risk Tag 연동 인터페이스는 추후 단계에서 작업 예정이다.
 
 > 본 프로젝트는 교육 목적으로 개발되며 실제 투자 조언에 사용할 수 없다. 백테스팅 성과가 미래 수익을 보장하지 않는다.

@@ -77,7 +77,9 @@ def train_one(data, name, reward_type, mdd_lambda, seed, timesteps, lookback, st
         tensorboard_log=str(LOGS_DIR / run_name),  # 실행별 로그 폴더
     )
     model.learn(total_timesteps=timesteps)                                # 학습 (명세: 10만 스텝 이상)
-    model.save(str(MODELS_DIR / run_name))                                # 모델 저장
+    # 모델 저장. '.zip'을 직접 붙인다: 'mdd_l1.0_s42' 처럼 이름에 점이 있으면 SB3가
+    # '.0_s42'를 확장자로 보고 .zip을 안 붙여서, 변형마다 파일 이름 규칙이 달라지기 때문.
+    model.save(str(MODELS_DIR / f"{run_name}.zip"))
 
     # ---------- 평가 구간: 학습된 정책을 '결정론적'으로 한 번 돌린다 ----------
     eval_env = build_eval_env_for_stage(data, stage, lookback)
