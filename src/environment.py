@@ -10,20 +10,39 @@ REWARD_TYPES = ("simple", "sharpe", "mdd")
 MAX_ASSET_WEIGHT = 0.4
 
 
+def _rowwise(fn, x):
+    """1차원 (N,) 이면 그대로, 2차원 (batch, N) 이면 행마다 fn을 적용한다.
+
+    SHAP·evaluation-xai 어댑터는 여러 관측을 한 번에 (batch, N) 행동으로 넘기므로
+    비중 변환 함수들은 두 모양을 모두 받아야 한다.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        return fn(x)
+    if x.ndim == 2:
+        return np.stack([fn(row) for row in x]) if len(x) else x.copy()
+    raise ValueError(f"입력은 (N,) 또는 (batch, N) 이어야 합니다: shape={x.shape}")
+
+
 def softmax(x):
-    """임의의 실수 벡터를 합=1, 각 원소>=0 인 비중으로 변환."""
+    """임의의 실수 벡터를 합=1, 각 원소>=0 인 비중으로 변환. (batch, N)이면 행마다."""
     x = np.clip(np.asarray(x, dtype=np.float64), -10, 10)  # 수치 폭발 방지
-    e_x = np.exp(x - np.max(x))                             # 오버플로우 방지
-    return e_x / e_x.sum()
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))     # 오버플로우 방지
+    return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
 def cap_weights(weights, max_weight=MAX_ASSET_WEIGHT):
-    """합=1 비중을 '각 자산 <= max_weight' 조건으로 투영한다.
+    """합=1 비중을 '각 자산 <= max_weight' 조건으로 투영한다. (batch, N)이면 행마다.
 
     상한을 넘친 자산은 max_weight로 고정하고, 넘친 만큼을 상한 아래 자산들에
     기존 비중에 비례해 나눠준다. 나눠준 뒤 또 넘치는 자산이 생길 수 있어 반복한다.
     (자산 N개면 최대 N번 반복하면 끝난다)
     """
+    return _rowwise(lambda w: _cap_one(w, max_weight), weights)
+
+
+def _cap_one(weights, max_weight):
+    """cap_weights의 1차원 버전."""
     w = np.asarray(weights, dtype=np.float64).copy()
     n = len(w)
     if max_weight * n < 1.0 - 1e-12:
@@ -47,7 +66,7 @@ def cap_weights(weights, max_weight=MAX_ASSET_WEIGHT):
 
 
 def action_to_weights(action, max_weight=MAX_ASSET_WEIGHT):
-    """PPO 행동 -> 목표 비중 (softmax -> 상한 투영).
+    """PPO 행동 -> 목표 비중 (softmax -> 상한 투영). (N,) -> (N,), (batch, N) -> (batch, N).
 
     학습 환경과 평가(predict_weights)가 반드시 이 함수 하나만 쓰게 해서
     학습 때 비중과 백테스트 때 비중이 어긋나지 않게 한다.
@@ -62,10 +81,11 @@ def weights_to_action(weights, floor=1e-12):
     상한 투영)으로 백테스트할 수 있다. 비중이 0인 자산은 floor로 아주 작게 둔다.
     softmax 입력이 [-10, 10]으로 잘리므로 최댓값을 10에 맞춰 범위를 최대한 쓴다
     (그래야 비중 0 자산이 e^-20 ≈ 2e-9 수준으로 사실상 0이 된다).
+    (batch, N) 입력이면 행마다 변환한다.
     """
     w = np.clip(np.asarray(weights, dtype=np.float64), floor, None)
-    log_w = np.log(w / w.sum())
-    return (log_w - log_w.max() + 10.0).astype(np.float32)
+    log_w = np.log(w / w.sum(axis=-1, keepdims=True))
+    return (log_w - log_w.max(axis=-1, keepdims=True) + 10.0).astype(np.float32)
 
 
 class PortfolioEnv(gym.Env):
@@ -97,6 +117,7 @@ class PortfolioEnv(gym.Env):
         random_start: bool = False,        # True면 에피소드마다 시작 날짜를 무작위로 (학습용)
         min_episode_days: int = 60,        # 무작위 시작 시 최소한 남겨둘 일수
         max_weight: float = MAX_ASSET_WEIGHT,  # 자산별 비중 상한 (0.4)
+        gamma: float = 0.99,               # PPO 할인율과 같게: Safe-Guard 페널티를 할인 기준으로 계산
     ):
         super().__init__()                 # gym.Env 초기화 (필수)
 
@@ -148,6 +169,9 @@ class PortfolioEnv(gym.Env):
         self.random_start = random_start
         self.min_episode_days = min_episode_days
         self.max_weight = max_weight
+        if not 0.0 < gamma <= 1.0:
+            raise ValueError(f"gamma는 (0, 1] 범위여야 합니다: {gamma}")
+        self.gamma = gamma
 
         # ---------- 행동 공간: 자산별 점수 -> softmax로 비중 변환 ----------
         self.action_space = spaces.Box(
@@ -231,7 +255,7 @@ class PortfolioEnv(gym.Env):
             "drawdown": current_drawdown,                      # 현재 낙폭 (MDD = 이 값의 최댓값)
             "net_return": net_return,
             "weights": self.weights.copy(),
-            "target_weights": target_weights.copy(),            # (float64, 상한 0.4 적용)            # SHAP/리포트용: 에이전트가 정한 비중
+            "target_weights": target_weights.copy(),            # SHAP/리포트용: 에이전트가 정한 비중 (float64, 상한 0.4)
             "turnover": turnover,
         }
         return self._get_observation(), reward, terminated, truncated, info
@@ -263,14 +287,23 @@ class PortfolioEnv(gym.Env):
 
         mdd 보상은 매 스텝 -lambda*DD_t 라서 거의 항상 음수다. 종료 후 보상이 0이면
         '일부러 15%를 깨고 빨리 끝내기'가 누적 보상이 더 높아지는 문제가 생긴다.
-        그래서 종료를 '남은 기간 내내 낙폭이 한도(15%)에 머문 것'으로 취급해
-        lambda * mdd_limit * (남은 스텝 수) 만큼 한 번에 뺀다.
-        끝까지 버티는 정책은 매 스텝 DD <= 15% 이므로 페널티가 이보다 클 수 없다
-        -> 조기 종료로 페널티를 피하는 길이 막힌다.
+        그래서 종료를 '남은 기간 내내 낙폭이 한도(15%)에 머문 것'으로 취급해 그 벌점을
+        PPO가 보는 방식(할인율 gamma)대로 합해서 한 번에 뺀다.
+
+            penalty = lambda * mdd_limit * (1 + g + g^2 + ... + g^(남은 스텝-1))
+
+        끝까지 버티는 정책은 매 스텝 DD <= 15% 이므로 같은 기간의 할인 벌점 합이 이보다 클 수 없다
+        -> PPO의 목표(할인 누적 보상) 기준으로 조기 종료가 이득이 되는 길이 막힌다.
+        할인을 반영하면 페널티 상한이 lambda * 0.15 / (1-g) (g=0.99면 lambda * 15)라서,
+        할인 없이 '남은 스텝 수'를 곱하던 예전 방식(lambda=5면 수백)보다 보상 정규화가 안정적이다.
 
         simple / sharpe 보상은 낙폭을 보상에 넣지 않는 '비교 기준' 변형이라 그대로 둔다.
         """
         if self.reward_type != "mdd":
             return 0.0
         remaining = self.n_steps - 1 - self.current_step        # 데이터 끝까지 남은 스텝
-        return float(self.mdd_lambda * self.mdd_limit * remaining)
+        if self.gamma >= 1.0:
+            horizon = float(remaining)
+        else:
+            horizon = (1.0 - self.gamma ** remaining) / (1.0 - self.gamma)  # 할인된 남은 스텝 수
+        return float(self.mdd_lambda * self.mdd_limit * horizon)

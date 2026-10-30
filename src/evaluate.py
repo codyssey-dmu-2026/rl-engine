@@ -8,7 +8,11 @@ train_compare.py 가 저장한 PPO 모델(models/ppo_{stage}_w{n}_{변형}_s{see
   eval_{stage}_windows.csv     : 윈도우 x 전략 x 시드 별 12개 지표
   eval_{stage}_walkforward.csv : 윈도우 1~4 평가 구간을 이어붙인 전체 기간(out-of-sample) 지표
   eval_{stage}_summary.csv     : 전략별 walk-forward 지표의 시드 평균/표준편차 (리포트용)
-  eval_{stage}_daily.csv       : 날짜별 수익률·낙폭·회전율 (그래프, ANOVA, evaluation-xai 연동용)
+  eval_{stage}_daily.csv       : 날짜별 수익률·벤치마크 수익률·낙폭·회전율 (그래프, ANOVA, evaluation-xai 연동용)
+
+상대성과(알파·베타·정보비율)의 벤치마크는 --benchmark 로 정한다 (기본 SPY, 'EqualWeight'도 가능).
+모델마다 학습 때 남긴 메타 정보(.json)로 자산 순서·관측 차원을 검사해서, 다른 데이터로 학습한
+모델(예: 가짜 데이터 모델)이 섞이면 멈춘다.
 
 예)
   python train_compare.py --stage test --windows 1 2 3 4 --seeds 42 43 44   # 먼저 학습
@@ -21,14 +25,15 @@ from pathlib import Path                   # 경로 처리
 import numpy as np                         # 수치 계산
 import pandas as pd                        # 결과 표
 
-from data_loader import DEFAULT_DATA_DIR, load_walk_forward_window
-from metrics import METRIC_NAMES, compute_metrics
+from data_loader import load_walk_forward_window, resolve_data_dir
+from metrics import ALL_METRIC_NAMES, compute_metrics
+from model_meta import check_compatible, load_meta
 from rollout import build_test_env, build_val_env, equal_weight_action_fn, run_episode
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 STAGES = ("val", "test")
-BENCHMARK = "EqualWeight"                  # 정보비율(information_ratio)의 기준 전략
+DEFAULT_BENCHMARK = "SPY"                  # 알파·베타·정보비율의 기준 (S&P500 추종 ETF, 지수 대용)
 
 # train_compare.EXPERIMENTS 와 같은 이름이어야 모델 파일을 찾는다.
 # (train_compare를 import하면 torch까지 읽어 느려서, 이름만 여기 둔다. 변형을 바꾸면 둘 다 고칠 것)
@@ -50,17 +55,23 @@ PPO_VARIANTS = [
 # ---------------------------------------------------------------------------
 BASELINES = {
     "EqualWeight": lambda env, data, stage: equal_weight_action_fn(env.n_assets),
-    # "MVO": mvo_action_fn,   # TODO: MVO 비교군 구현 후 등록
+    # MVO 비교군은 evaluation-xai(baselines.py)에 명세대로 구현돼 있다. 두 곳에서 따로 구현하면
+    # 숫자가 달라지므로 여기서는 만들지 않는다. 필요하면 그 함수를 감싸 weights_to_action 으로 등록.
 }
 
 
 def pick_data_dir(cli_value):
-    """train.pick_data_dir 와 같은 규칙 (train.py는 torch를 읽어서 여기 따로 둔다)."""
-    if cli_value:
-        return Path(cli_value)
-    if (DEFAULT_DATA_DIR / "walk_forward_manifest.json").exists():
-        return DEFAULT_DATA_DIR
-    return ROOT / "data" / "dummy"
+    """data_loader.resolve_data_dir 와 같음. 실데이터가 없으면 에러 (가짜는 --data-dir 로 직접 지정)."""
+    return resolve_data_dir(cli_value)
+
+
+def benchmark_returns(data, stage, benchmark):
+    """평가 구간 날짜별 벤치마크 일간 단순수익률. benchmark가 자산 티커일 때만 (EqualWeight는 따로)."""
+    returns = data.val_returns if stage == "val" else data.test_returns
+    col = f"{benchmark}_return"
+    if col not in returns.columns:
+        raise ValueError(f"벤치마크 '{benchmark}'가 자산 목록에 없습니다: {data.tickers} (또는 EqualWeight)")
+    return np.expm1(returns[col].astype(np.float64))           # 로그수익률 -> 단순수익률
 
 
 def build_eval_env(data, stage, lookback):
@@ -92,12 +103,18 @@ def run_strategy(data, stage, lookback, action_fn_factory):
     return run_episode(env, action_fn)
 
 
-def evaluate_window(data, stage, lookback, seeds, variants, models_dir, baselines_only=False):
+def evaluate_window(data, stage, lookback, seeds, variants, models_dir, baselines_only=False,
+                    benchmark=DEFAULT_BENCHMARK, allow_dummy=False):
     """한 윈도우의 모든 전략을 돌린다. (날짜별 기록 list, 없는 모델 경로 list)"""
     frames, missing = [], []
+    bench = None if benchmark == "EqualWeight" else benchmark_returns(data, stage, benchmark)
 
     def add(df, strategy, seed, reward_type, mdd_lambda):
+        nonlocal bench
         df = df.copy()
+        if bench is None:                                    # EqualWeight 벤치마크: 첫 기준선 결과를 씀
+            bench = df["net_return"].copy() if strategy == "EqualWeight" else None
+        df["benchmark_return"] = bench.reindex(df.index).to_numpy() if bench is not None else np.nan
         df["window"] = data.window
         df["strategy"] = strategy
         df["seed"] = seed
@@ -118,6 +135,11 @@ def evaluate_window(data, stage, lookback, seeds, variants, models_dir, baseline
             if not path.exists():
                 missing.append(path)
                 continue
+            meta = load_meta(path)
+            if meta is None:
+                print(f"  [경고] {path.name}: 메타 정보(.json)가 없는 예전 모델 -> 자산 순서 검사를 못 함")
+            else:
+                check_compatible(meta, data, build_eval_env(data, stage, lookback), allow_dummy=allow_dummy)
             model = load_ppo(path)
             df = run_strategy(data, stage, lookback,
                               lambda env, m=model: (lambda obs: m.predict(obs, deterministic=True)[0]))
@@ -126,15 +148,10 @@ def evaluate_window(data, stage, lookback, seeds, variants, models_dir, baseline
 
 
 def metrics_table(daily, group_cols, mdd_limit=0.15):
-    """날짜별 기록을 group_cols 단위로 묶어 12개 지표 표를 만든다.
+    """날짜별 기록을 group_cols 단위로 묶어 12개(+보조) 지표 표를 만든다.
 
-    벤치마크(동일가중)는 같은 group에서 seed/strategy만 뺀 키로 찾는다.
+    벤치마크 수익률은 daily 의 benchmark_return 컬럼(같은 날짜)을 쓴다.
     """
-    bench_keys = [c for c in group_cols if c not in ("strategy", "seed", "reward_type", "mdd_lambda")]
-    bench = daily[daily["strategy"] == BENCHMARK]
-    bench_series = {k if isinstance(k, tuple) else (k,): g["net_return"]
-                    for k, g in (bench.groupby(bench_keys) if bench_keys else [((), bench)])}
-
     rows = []
     for key, g in daily.groupby(group_cols, dropna=False, sort=False):
         key = key if isinstance(key, tuple) else (key,)
@@ -142,8 +159,7 @@ def metrics_table(daily, group_cols, mdd_limit=0.15):
         g = g.sort_index()
         if g.index.has_duplicates:
             raise ValueError(f"{info}: 같은 날짜가 두 번 있습니다 (평가 구간이 겹침)")
-        b = bench_series.get(tuple(info[c] for c in bench_keys))
-        m = compute_metrics(g["net_return"], g["turnover"], benchmark=b)
+        m = compute_metrics(g["net_return"], g["turnover"], benchmark=g["benchmark_return"])
         mdd = m["max_mdd"]
         rows.append({
             **info,
@@ -159,7 +175,7 @@ def metrics_table(daily, group_cols, mdd_limit=0.15):
 
 def summarize_over_seeds(walkforward):
     """전략별로 시드 평균/표준편차 (기준선은 시드가 없으니 std=NaN)."""
-    agg = walkforward.groupby("strategy", sort=False)[METRIC_NAMES].agg(["mean", "std"])
+    agg = walkforward.groupby("strategy", sort=False)[ALL_METRIC_NAMES].agg(["mean", "std"])
     agg.columns = [f"{m}_{s}" for m, s in agg.columns]
     agg.insert(0, "n_seeds", walkforward.groupby("strategy", sort=False).size())
     return agg.reset_index()
@@ -167,7 +183,12 @@ def summarize_over_seeds(walkforward):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default=None, help="parquet 폴더 (기본: data/processed 또는 data/dummy)")
+    parser.add_argument("--data-dir", default=None,
+                        help="parquet 폴더 (기본: data/processed 실데이터. 가짜는 ../data/dummy 를 직접 지정)")
+    parser.add_argument("--risk-file", default=None, help="(선택) 학습 때 쓴 RiskTag 관측 parquet")
+    parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK,
+                        help="알파·베타·정보비율 기준: 자산 티커(기본 SPY) 또는 EqualWeight")
+    parser.add_argument("--allow-dummy", action="store_true", help="가짜 데이터로 학습한 모델도 평가 (테스트용)")
     parser.add_argument("--models-dir", default=str(MODELS_DIR), help="PPO 모델 폴더")
     parser.add_argument("--stage", default="test", choices=STAGES,
                         help="test: 최종 보고용(기본) / val: 선택 단계 모델 평가")
@@ -181,13 +202,15 @@ def main():
 
     data_dir = pick_data_dir(args.data_dir)
     variants = [v for v in PPO_VARIANTS if args.only is None or v["name"] in args.only]
-    print(f"데이터 폴더: {data_dir} | stage={args.stage} | windows={args.windows} | seeds={args.seeds}")
+    print(f"데이터 폴더: {data_dir} | stage={args.stage} | windows={args.windows} | seeds={args.seeds} "
+          f"| benchmark={args.benchmark}")
 
     frames, missing = [], []
     for window in args.windows:
-        data = load_walk_forward_window(window, data_dir)
+        data = load_walk_forward_window(window, data_dir, risk_file=args.risk_file)
         f, m = evaluate_window(data, args.stage, args.lookback, args.seeds, variants,
-                               args.models_dir, args.baselines_only)
+                               args.models_dir, args.baselines_only, args.benchmark,
+                               allow_dummy=args.allow_dummy or data.is_dummy)
         frames += f
         missing += m
         print(f"  window {window}: 전략 {len(f)}개 평가 (없는 모델 {len(m)}개)")
@@ -210,18 +233,18 @@ def main():
     by_window.to_csv(out_dir / f"eval_{args.stage}_windows.csv", index=False)
     walkforward.to_csv(out_dir / f"eval_{args.stage}_walkforward.csv", index=False)
     summary.to_csv(out_dir / f"eval_{args.stage}_summary.csv", index=False)
-    daily.reset_index()[["date", "window", "strategy", "seed", "net_return", "portfolio_value",
-                         "drawdown", "turnover", "max_target_weight"]] \
+    daily.reset_index()[["date", "window", "strategy", "seed", "net_return", "benchmark_return",
+                         "portfolio_value", "drawdown", "turnover", "max_target_weight"]] \
         .to_csv(out_dir / f"eval_{args.stage}_daily.csv", index=False)
 
     show = ["strategy", "seed", "days", "cum_return", "cagr", "sharpe", "sortino", "max_mdd",
-            "calmar", "cvar_95", "avg_turnover", "information_ratio"]
+            "calmar", "cvar_95", "alpha", "beta", "information_ratio", "avg_turnover"]
     with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
         print(f"\n=== Walk-Forward {args.stage} (windows {args.windows} 연결) ===")
         print(walkforward[show].to_string(index=False))
         print("\n=== 전략별 시드 평균 ===")
         print(summary[["strategy", "n_seeds"] + [f"{m}_mean" for m in
-                       ("cum_return", "sharpe", "max_mdd", "calmar", "information_ratio")]]
+                       ("cum_return", "sharpe", "max_mdd", "calmar", "alpha", "information_ratio")]]
               .to_string(index=False))
 
     if len(incomplete) > 0:
