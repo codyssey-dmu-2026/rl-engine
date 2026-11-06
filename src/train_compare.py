@@ -36,7 +36,9 @@ SHOW_COLS = ["stage", "window", "strategy", "seed", "cum_return", "sharpe", "max
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default=None, help="parquet 폴더 (기본: data/processed 또는 data/dummy)")
+    parser.add_argument("--data-dir", default=None,
+                        help="parquet 폴더 (기본: data/processed 실데이터. 가짜는 ../data/dummy 를 직접 지정)")
+    parser.add_argument("--risk-file", default=None, help="(선택) RiskTag 관측 parquet")
     parser.add_argument("--stage", default="val", choices=STAGES, help="val: 선택용(기본) / test: 최종 보고용")
     parser.add_argument("--windows", type=int, nargs="+", default=[1], help="walk-forward 윈도우 번호들")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="시드 목록 (ANOVA용으로 여러 개 권장)")
@@ -51,7 +53,7 @@ def main():
 
     rows = []
     for window in args.windows:
-        data = load_walk_forward_window(window, data_dir)
+        data = load_walk_forward_window(window, data_dir, risk_file=args.risk_file)
         print(f"\nwindow {window}: fit {len(data.fit_features)}일 / val {len(data.val_features)}일 "
               f"(val 시작 {data.val_start}) / test {len(data.test_features)}일")
         rows.append(baseline_metrics(data, args.lookback, stage=args.stage))     # 동일가중 기준선
@@ -59,7 +61,7 @@ def main():
             for exp in experiments:
                 t0 = time.time()
                 m = train_one(data, exp["name"], exp["reward_type"], exp["mdd_lambda"],
-                              seed, args.timesteps, args.lookback, stage=args.stage)
+                              seed, args.timesteps, args.lookback, stage=args.stage, data_dir=data_dir)
                 rows.append(m)
                 print(f"  {m['strategy']:>14} s{seed} | 누적 {m['cum_return']:+.2%} | 샤프 {m['sharpe']:+.2f} | "
                       f"MDD {m['max_mdd']:.2%} | 최대비중 {m['max_weight']:.3f} | {time.time() - t0:.0f}s")

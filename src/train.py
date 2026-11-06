@@ -7,8 +7,9 @@ from stable_baselines3 import PPO                                    # PPO 알�
 from stable_baselines3.common.monitor import Monitor                 # 에피소드 보상 기록 (학습곡선용)
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize  # 벡터 환경 + 보상 스케일 보정
 
-from data_loader import DEFAULT_DATA_DIR, load_walk_forward_window   # 데이터 로더
+from data_loader import load_walk_forward_window, resolve_data_dir   # 데이터 로더
 from environment import PortfolioEnv                                  # 강화학습 환경
+from model_meta import build_meta, save_meta                          # 모델 옆 메타 정보(JSON)
 from rollout import build_test_env, build_val_env, equal_weight_action_fn, run_episode, summarize
 
 ROOT = Path(__file__).resolve().parent.parent      # 프로젝트 루트
@@ -19,6 +20,7 @@ LOGS_DIR = ROOT / "logs"                           # tensorboard 로그 폴더
 #   val : fit 구간에서 학습 -> val 구간에서 평가  (보상형/lambda/하이퍼파라미터 선택은 여기서만)
 #   test: train 전체(fit+val)에서 재학습 -> test 구간에서 평가  (고른 설정의 최종 성과 보고)
 STAGES = ("val", "test")
+GAMMA = 0.99                                       # PPO 할인율 (환경의 Safe-Guard 페널티도 같은 값 사용)
 
 
 def split_for_stage(data, stage):
@@ -36,27 +38,27 @@ def build_eval_env_for_stage(data, stage, lookback):
 
 
 def pick_data_dir(cli_value):
-    """--data-dir 이 없으면 실제 데이터(data/processed), 그것도 없으면 가짜(data/dummy)를 쓴다."""
-    if cli_value:
-        return Path(cli_value)
-    if (DEFAULT_DATA_DIR / "walk_forward_manifest.json").exists():
-        return DEFAULT_DATA_DIR
-    return ROOT / "data" / "dummy"
+    """data_loader.resolve_data_dir 와 같음 (예전 이름 유지). 실데이터가 없으면 에러."""
+    return resolve_data_dir(cli_value)
 
 
-def train_one(data, name, reward_type, mdd_lambda, seed, timesteps, lookback, stage="val"):
-    """보상함수 한 가지로 PPO를 학습하고, stage에 맞는 평가 구간 성과를 dict로 돌려준다."""
+def train_one(data, name, reward_type, mdd_lambda, seed, timesteps, lookback, stage="val", data_dir=None):
+    """보상함수 한 가지로 PPO를 학습하고, stage에 맞는 평가 구간 성과를 dict로 돌려준다.
+
+    모델(.zip) 옆에 같은 이름의 .json 메타 정보(자산 순서, 관측 차원, 데이터 폴더 등)를 남긴다.
+    """
     run_name = f"ppo_{stage}_w{data.window}_{name}_s{seed}"               # 예: ppo_val_w1_mdd_l1.0_s42
     MODELS_DIR.mkdir(exist_ok=True)                                       # 폴더 없으면 생성
     LOGS_DIR.mkdir(exist_ok=True)
     fit_features, fit_returns = split_for_stage(data, stage)
 
     # ---------- 학습 환경: 평가 구간 이전 데이터만 사용 (평가 구간은 절대 안 봄) ----------
-    train_env = Monitor(PortfolioEnv(
+    base_env = PortfolioEnv(
         fit_features, fit_returns,
-        lookback=lookback, reward_type=reward_type, mdd_lambda=mdd_lambda,
+        lookback=lookback, reward_type=reward_type, mdd_lambda=mdd_lambda, gamma=GAMMA,
         random_start=True,                 # 학습 때만: 에피소드마다 시작일을 무작위로 (평가는 고정 시작)
-    ))
+    )
+    train_env = Monitor(base_env)
     # 보상 스케일 보정: 보상함수마다 값의 크기가 수십~수백 배 달라서(예: sharpe vs simple)
     # PPO 학습이 불안정해지는 것을 막는다. 관측값은 이미 정규화돼 있으므로 norm_obs=False.
     # clip_reward=np.inf: 기본값(10)이면 Safe-Guard 종료 페널티가 잘려서 '빨리 끝내기' 방지 효과가 사라진다.
@@ -70,14 +72,21 @@ def train_one(data, name, reward_type, mdd_lambda, seed, timesteps, lookback, st
         n_steps=2048,                      # 업데이트 전 수집할 스텝 수
         batch_size=64,                     # 미니배치 크기
         n_epochs=10,                       # 수집 데이터 재사용 횟수
-        gamma=0.99,                        # 할인율
+        gamma=GAMMA,                       # 할인율 (환경 Safe-Guard 페널티와 같은 값)
         clip_range=0.2,                    # PPO 핵심: 정책 변화 제한폭
         seed=seed,                         # 시드 고정 (재현성)
         verbose=0,                         # 로그 최소화
         tensorboard_log=str(LOGS_DIR / run_name),  # 실행별 로그 폴더
     )
     model.learn(total_timesteps=timesteps)                                # 학습 (명세: 10만 스텝 이상)
-    model.save(str(MODELS_DIR / run_name))                                # 모델 저장
+    # 모델 저장. '.zip'을 직접 붙인다: 'mdd_l1.0_s42' 처럼 이름에 점이 있으면 SB3가
+    # '.0_s42'를 확장자로 보고 .zip을 안 붙여서, 변형마다 파일 이름 규칙이 달라지기 때문.
+    model_file = MODELS_DIR / f"{run_name}.zip"
+    model.save(str(model_file))
+    save_meta(model_file, build_meta(
+        data, base_env, stage=stage, name=name, reward_type=reward_type, mdd_lambda=mdd_lambda,
+        seed=seed, timesteps=timesteps, gamma=GAMMA, data_dir=data_dir,
+    ))
 
     # ---------- 평가 구간: 학습된 정책을 '결정론적'으로 한 번 돌린다 ----------
     eval_env = build_eval_env_for_stage(data, stage, lookback)
@@ -100,7 +109,10 @@ def baseline_metrics(data, lookback, stage="val"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default=None, help="parquet 폴더 (기본: data/processed 또는 data/dummy)")
+    parser.add_argument("--data-dir", default=None,
+                        help="parquet 폴더 (기본: data/processed 실데이터. 가짜는 ../data/dummy 를 직접 지정)")
+    parser.add_argument("--risk-file", default=None,
+                        help="(선택) RiskTag 관측 parquet. 주면 관측이 288 -> 300차원 ({ticker}_risk 12개)")
     parser.add_argument("--window", type=int, default=1, help="walk-forward 윈도우 번호 (1~4)")
     parser.add_argument("--reward", default="simple", choices=["simple", "sharpe", "mdd"])
     parser.add_argument("--mdd-lambda", type=float, default=1.0, help="mdd 보상의 페널티 강도 (0.5~5.0)")
@@ -113,14 +125,14 @@ def main():
 
     data_dir = pick_data_dir(args.data_dir)
     print(f"데이터 폴더: {data_dir}")
-    data = load_walk_forward_window(args.window, data_dir)
+    data = load_walk_forward_window(args.window, data_dir, risk_file=args.risk_file)
     print(f"window {data.window}: fit {len(data.fit_features)}일 / val {len(data.val_features)}일 "
           f"/ test {len(data.test_features)}일")
 
     name = args.reward if args.reward != "mdd" else f"mdd_l{args.mdd_lambda}"
     print(f"학습 시작: {name}, {args.timesteps} 스텝, seed={args.seed}, stage={args.stage}")
     ppo = train_one(data, name, args.reward, args.mdd_lambda, args.seed, args.timesteps, args.lookback,
-                    stage=args.stage)
+                    stage=args.stage, data_dir=data_dir)
     base = baseline_metrics(data, args.lookback, stage=args.stage)
 
     print(f"\n=== {args.stage} 구간 성과 비교 ===")

@@ -218,5 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 data/
-models/
 logs/
+# 모델 파일(.zip)은 용량이 커서 제외하고, 결과 요약 CSV와 모델 메타(.json)만 추적한다
+models/*
+!models/*.csv
+!models/*.json
